@@ -19,8 +19,8 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/hirochachacha/go-smb2"
 	"github.com/joho/godotenv"
-	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
+	_ "modernc.org/sqlite"
 )
 
 // Config holds all the literal strings used in the application
@@ -691,7 +691,7 @@ func initDatabase() error {
 		dbFile = "data.db"
 	}
 
-	db, err = sql.Open("sqlite3", dbFile)
+	db, err = sql.Open("sqlite", dbFile)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %v", err)
 	}

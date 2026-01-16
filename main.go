@@ -3,16 +3,20 @@ package main
 import (
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/hirochachacha/go-smb2"
 	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v2"
 )
@@ -136,12 +140,155 @@ type App struct {
 var apps []App
 var templates *template.Template
 var appsMutex sync.RWMutex
+var globalSMBManager *SMBManager
+
+type SMBShare struct {
+	Host     string
+	Share    string
+	Path     string
+	Username string
+	Password string
+	Domain   string
+}
+
+type SMBConnection struct {
+	Session *smb2.Session
+	Share   *smb2.Share
+}
+
+type SMBManager struct {
+	connections map[string]*SMBConnection
+	mutex       sync.RWMutex
+}
+
+func NewSMBManager() *SMBManager {
+	return &SMBManager{
+		connections: make(map[string]*SMBConnection),
+	}
+}
+
+func (sm *SMBManager) Connect(shareInfo SMBShare) error {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	shareKey := fmt.Sprintf("%s/%s", shareInfo.Host, shareInfo.Share)
+
+	// Close existing connection if any
+	if existingConn, exists := sm.connections[shareKey]; exists {
+		existingConn.Share.Umount()
+		existingConn.Session.Logoff()
+		delete(sm.connections, shareKey)
+	}
+
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:445", shareInfo.Host))
+	if err != nil {
+		return fmt.Errorf("failed to connect to SMB host %s: %v", shareInfo.Host, err)
+	}
+
+	dialer := &smb2.Dialer{}
+
+	if shareInfo.Username != "" {
+		// Authenticated access
+		dialer.Initiator = &smb2.NTLMInitiator{
+			User:     shareInfo.Username,
+			Password: shareInfo.Password,
+		}
+		if shareInfo.Domain != "" {
+			dialer.Initiator.(*smb2.NTLMInitiator).Domain = shareInfo.Domain
+		}
+	} else {
+		// Anonymous access - use guest account
+		dialer.Initiator = &smb2.NTLMInitiator{
+			User:     "guest",
+			Password: "",
+		}
+	}
+
+	session, err := dialer.Dial(conn)
+	if err != nil {
+		conn.Close()
+		if shareInfo.Username == "" {
+			return fmt.Errorf("failed to establish anonymous SMB session with %s: %v", shareInfo.Host, err)
+		}
+		return fmt.Errorf("failed to establish authenticated SMB session with %s: %v", shareInfo.Host, err)
+	}
+
+	share, err := session.Mount(shareInfo.Share)
+	if err != nil {
+		session.Logoff()
+		conn.Close()
+		return fmt.Errorf("failed to mount SMB share %s: %v", shareInfo.Share, err)
+	}
+
+	sm.connections[shareKey] = &SMBConnection{
+		Session: session,
+		Share:   share,
+	}
+
+	if shareInfo.Username == "" {
+		log.Printf("Connected via guest account to SMB share: %s", shareKey)
+	} else {
+		log.Printf("Connected with credentials to SMB share: %s (user: %s)", shareKey, shareInfo.Username)
+	}
+	return nil
+}
+
+func (sm *SMBManager) GetConnection(shareKey string) (*SMBConnection, error) {
+	sm.mutex.RLock()
+	defer sm.mutex.RUnlock()
+
+	conn, exists := sm.connections[shareKey]
+	if !exists {
+		return nil, fmt.Errorf("SMB connection not found: %s", shareKey)
+	}
+	return conn, nil
+}
+
+func (sm *SMBManager) CloseAll() {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	for _, conn := range sm.connections {
+		conn.Share.Umount()
+		conn.Session.Logoff()
+	}
+	sm.connections = make(map[string]*SMBConnection)
+}
+
+func parseSMBPath(path string) (*SMBShare, bool) {
+	// Parse UNC path like \\192.168.1.151\share\folder
+	re := regexp.MustCompile(`^\\\\([^\\]+)\\([^\\]+)(?:\\(.*))?$`)
+	matches := re.FindStringSubmatch(path)
+	if len(matches) < 3 {
+		return nil, false
+	}
+
+	shareInfo := &SMBShare{
+		Host:  matches[1],
+		Share: matches[2],
+		Path:  "",
+	}
+
+	if len(matches) > 3 {
+		shareInfo.Path = matches[3]
+	}
+
+	// Get credentials from environment variables
+	host := strings.ReplaceAll(shareInfo.Host, ".", "_")
+	shareInfo.Username = os.Getenv(fmt.Sprintf("SMB_USER_%s", host))
+	shareInfo.Password = os.Getenv(fmt.Sprintf("SMB_PASS_%s", host))
+	shareInfo.Domain = os.Getenv(fmt.Sprintf("SMB_DOMAIN_%s", host))
+
+	return shareInfo, true
+}
 
 type AppWatcher struct {
 	watcher    *fsnotify.Watcher
 	watchPaths []string
 	stopChan   chan bool
 	ticker     *time.Ticker
+	smbManager *SMBManager
+	smbPaths   map[string]SMBShare
 }
 
 type PackageMetadata struct {
@@ -164,10 +311,31 @@ func NewAppWatcher(watchPaths []string) (*AppWatcher, error) {
 		return nil, err
 	}
 
+	smbManager := NewSMBManager()
+	smbPaths := make(map[string]SMBShare)
+
+	// Identify and connect to SMB shares
+	localPaths := make([]string, 0)
+	for _, path := range watchPaths {
+		if shareInfo, isSMB := parseSMBPath(path); isSMB {
+			shareKey := fmt.Sprintf("%s/%s", shareInfo.Host, shareInfo.Share)
+			smbPaths[shareKey] = *shareInfo
+			if err := smbManager.Connect(*shareInfo); err != nil {
+				log.Printf("Failed to connect to SMB share %s: %v", shareKey, err)
+			} else {
+				log.Printf("Connected to SMB share: %s", shareKey)
+			}
+		} else {
+			localPaths = append(localPaths, path)
+		}
+	}
+
 	return &AppWatcher{
 		watcher:    watcher,
-		watchPaths: watchPaths,
+		watchPaths: localPaths,
 		stopChan:   make(chan bool),
+		smbManager: smbManager,
+		smbPaths:   smbPaths,
 	}, nil
 }
 
@@ -210,6 +378,7 @@ func (aw *AppWatcher) watchLoop() {
 			log.Printf("Watcher error: %v", err)
 		case <-aw.ticker.C:
 			aw.scanExistingPackages()
+			aw.scanSMBShares()
 			log.Printf("Periodic scan completed")
 		case <-aw.stopChan:
 			return
@@ -218,6 +387,7 @@ func (aw *AppWatcher) watchLoop() {
 }
 
 func (aw *AppWatcher) scanExistingPackages() {
+	// Scan local paths
 	for _, watchPath := range aw.watchPaths {
 		filepath.WalkDir(watchPath, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
@@ -229,10 +399,76 @@ func (aw *AppWatcher) scanExistingPackages() {
 			return nil
 		})
 	}
+
+	// Scan SMB paths
+	for shareKey, shareInfo := range aw.smbPaths {
+		aw.scanSMBShare(shareKey, shareInfo)
+	}
 }
 
 func (aw *AppWatcher) isPackageFile(filename string) bool {
 	return filepath.Base(filename) == "README.md"
+}
+
+func (aw *AppWatcher) scanSMBShare(shareKey string, shareInfo SMBShare) {
+	conn, err := aw.smbManager.GetConnection(shareKey)
+	if err != nil {
+		log.Printf("Failed to get SMB connection for %s: %v", shareKey, err)
+		return
+	}
+
+	basePath := shareInfo.Path
+	if basePath == "" {
+		basePath = "."
+	}
+
+	err = aw.walkSMBDirectory(conn.Share, basePath, shareKey)
+	if err != nil {
+		log.Printf("Failed to walk SMB directory %s: %v", basePath, err)
+	}
+}
+
+func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey string) error {
+	dir, err := share.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+
+	entries, err := dir.Readdir(-1)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		fullPath := filepath.Join(path, entry.Name())
+
+		if entry.IsDir() {
+			err = aw.walkSMBDirectory(share, fullPath, shareKey)
+			if err != nil {
+				log.Printf("Error walking SMB directory %s: %v", fullPath, err)
+			}
+		} else if aw.isPackageFile(entry.Name()) {
+			aw.processSMBPackage(fullPath, shareKey)
+		}
+	}
+
+	return nil
+}
+
+func (aw *AppWatcher) scanSMBShares() {
+	for shareKey, shareInfo := range aw.smbPaths {
+		// Try to reconnect if connection is lost
+		if _, err := aw.smbManager.GetConnection(shareKey); err != nil {
+			if err := aw.smbManager.Connect(shareInfo); err != nil {
+				log.Printf("Failed to reconnect to SMB share %s: %v", shareKey, err)
+				continue
+			}
+			log.Printf("Reconnected to SMB share: %s", shareKey)
+		}
+
+		aw.scanSMBShare(shareKey, shareInfo)
+	}
 }
 
 func (aw *AppWatcher) processPackage(readmePath string) {
@@ -291,17 +527,84 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 	log.Printf("Added new app: %s", app.Name)
 }
 
+func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
+	dirPath := filepath.Dir(readmePath)
+	dirName := filepath.Base(dirPath)
+
+	// Create unique ID with SMB prefix
+	uniqueID := fmt.Sprintf("smb:%s/%s", shareKey, dirName)
+
+	metadata, err := aw.extractSMBMetadata(readmePath, shareKey)
+	if err != nil {
+		log.Printf("Failed to extract metadata from SMB %s: %v", readmePath, err)
+		return
+	}
+
+	app := App{
+		ID:           uniqueID,
+		Name:         metadata.Name,
+		Category:     metadata.Category,
+		Description:  metadata.Description,
+		Version:      metadata.Version,
+		Developer:    metadata.Developer,
+		Rating:       metadata.Rating,
+		Downloads:    metadata.Downloads,
+		Price:        metadata.Price,
+		Icon:         metadata.Icon,
+		DownloadLink: metadata.DownloadLink,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    metadata.UpdateTime,
+	}
+
+	appsMutex.Lock()
+	defer appsMutex.Unlock()
+
+	for i, existingApp := range apps {
+		if existingApp.ID == app.ID {
+			apps[i] = app
+			log.Printf("Updated SMB app: %s", app.Name)
+			return
+		}
+	}
+
+	apps = append(apps, app)
+	log.Printf("Added new SMB app: %s", app.Name)
+}
+
 func (aw *AppWatcher) extractMetadata(filePath string) (PackageMetadata, error) {
 	return aw.parseReadmeMetadata(filePath)
 }
 
-func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, error) {
-	content, err := os.ReadFile(readmePath)
+func (aw *AppWatcher) extractSMBMetadata(readmePath string, shareKey string) (PackageMetadata, error) {
+	conn, err := aw.smbManager.GetConnection(shareKey)
 	if err != nil {
-		return PackageMetadata{}, err
+		return PackageMetadata{}, fmt.Errorf("failed to get SMB connection: %v", err)
 	}
 
-	contentStr := string(content)
+	file, err := conn.Share.Open(readmePath)
+	if err != nil {
+		return PackageMetadata{}, fmt.Errorf("failed to open SMB file %s: %v", readmePath, err)
+	}
+	defer file.Close()
+
+	// Read file content manually since it's an SMB file
+	content := make([]byte, 0, 4096)
+	buf := make([]byte, 1024)
+	for {
+		n, err := file.Read(buf)
+		if err != nil && err != io.EOF {
+			return PackageMetadata{}, fmt.Errorf("failed to read SMB file %s: %v", readmePath, err)
+		}
+		if n == 0 {
+			break
+		}
+		content = append(content, buf[:n]...)
+	}
+
+	return aw.parseReadmeContent(string(content), filepath.Base(filepath.Dir(readmePath)))
+}
+
+func (aw *AppWatcher) parseReadmeContent(contentStr, dirName string) (PackageMetadata, error) {
 	metadata := PackageMetadata{
 		Name:         "Unknown",
 		Category:     "Unknown",
@@ -376,13 +679,22 @@ func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, e
 			}
 
 			if metadata.Name == "Unknown" {
-				dirName := filepath.Base(filepath.Dir(readmePath))
 				metadata.Name = dirName
 			}
 		}
 	}
 
 	return metadata, nil
+}
+
+func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, error) {
+	content, err := os.ReadFile(readmePath)
+	if err != nil {
+		return PackageMetadata{}, err
+	}
+
+	dirName := filepath.Base(filepath.Dir(readmePath))
+	return aw.parseReadmeContent(string(content), dirName)
 }
 
 func init() {
@@ -536,7 +848,13 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Otherwise, treat as relative file path and proxy the download
+	// Check if this is an SMB app
+	if strings.HasPrefix(app.ID, "smb:") {
+		serveSMBFile(w, r, app)
+		return
+	}
+
+	// Otherwise, treat as local file path and proxy the download
 	// Try to find the app in any of the watched directories
 	var filePath string
 	watchPaths := strings.Split(os.Getenv("MANAGED_FOLDERS"), ",")
@@ -546,6 +864,10 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	for _, watchPath := range watchPaths {
 		watchPath = strings.TrimSpace(watchPath)
+		// Skip SMB paths for local file serving
+		if strings.HasPrefix(watchPath, "\\\\") {
+			continue
+		}
 		testPath := filepath.Join(watchPath, appID, app.DownloadLink)
 		if _, err := os.Stat(testPath); err == nil {
 			filePath = testPath
@@ -554,11 +876,73 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if filePath == "" {
-		// Fallback to first watched path
-		filePath = filepath.Join(strings.TrimSpace(watchPaths[0]), appID, app.DownloadLink)
+		// Fallback to first local watched path
+		for _, watchPath := range watchPaths {
+			watchPath = strings.TrimSpace(watchPath)
+			if !strings.HasPrefix(watchPath, "\\\\") {
+				filePath = filepath.Join(watchPath, appID, app.DownloadLink)
+				break
+			}
+		}
 	}
 
 	http.ServeFile(w, r, filePath)
+}
+
+func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
+	// Parse SMB app ID to get share info
+	// Format: smb:host/share/path
+	parts := strings.SplitN(strings.TrimPrefix(app.ID, "smb:"), "/", 3)
+	if len(parts) < 2 {
+		http.Error(w, "Invalid SMB app ID format", http.StatusInternalServerError)
+		return
+	}
+
+	host := parts[0]
+	share := parts[1]
+	shareKey := fmt.Sprintf("%s/%s", host, share)
+
+	// Extract relative path from app ID
+	var relativePath string
+	if len(parts) > 2 {
+		relativePath = parts[2]
+	}
+
+	// Get SMB connection
+	conn, err := globalSMBManager.GetConnection(shareKey)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("SMB connection error: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Construct full file path
+	filePath := filepath.Join(relativePath, app.DownloadLink)
+
+	// Open SMB file
+	file, err := conn.Share.Open(filePath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to open SMB file: %v", err), http.StatusNotFound)
+		return
+	}
+	defer file.Close()
+
+	// Get file info for headers
+	fileInfo, err := file.Stat()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get SMB file info: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Set headers
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(app.DownloadLink)))
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", fileInfo.Size()))
+
+	// Stream file content
+	_, err = io.Copy(w, file)
+	if err != nil {
+		log.Printf("Error streaming SMB file: %v", err)
+	}
 }
 
 func renderTemplate(w http.ResponseWriter, templateName string, data interface{}) {
@@ -599,10 +983,13 @@ func main() {
 		log.Fatal("Failed to create watcher:", err)
 	}
 
+	globalSMBManager = watcher.smbManager
+
 	if err := watcher.Start(); err != nil {
 		log.Fatal("Failed to start watcher:", err)
 	}
 	defer watcher.Stop()
+	defer globalSMBManager.CloseAll()
 
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/apps", appListHandler)

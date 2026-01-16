@@ -258,9 +258,12 @@ func (sm *SMBManager) CloseAll() {
 }
 
 func parseSMBPath(path string) (*SMBShare, bool) {
-	// Parse UNC path like \\192.168.1.151\share\folder
-	re := regexp.MustCompile(`^\\\\([^\\]+)\\([^\\]+)(?:\\(.*))?$`)
-	matches := re.FindStringSubmatch(path)
+	// Normalize path to use forward slashes for consistent processing
+	normalizedPath := strings.ReplaceAll(path, "\\", "/")
+
+	// Parse UNC path like \\192.168.1.151\share\folder or //192.168.1.151/share/folder
+	re := regexp.MustCompile(`^[/\\]{2}([^/\\]+)[/\\]([^/\\]+)(?:[/\\](.*))?$`)
+	matches := re.FindStringSubmatch(normalizedPath)
 	if len(matches) < 3 {
 		return nil, false
 	}
@@ -271,7 +274,7 @@ func parseSMBPath(path string) (*SMBShare, bool) {
 		Path:  "",
 	}
 
-	if len(matches) > 3 {
+	if len(matches) > 3 && matches[3] != "" {
 		shareInfo.Path = matches[3]
 	}
 
@@ -413,9 +416,12 @@ func (aw *AppWatcher) isPackageFile(filename string) bool {
 }
 
 func (aw *AppWatcher) scanSMBShare(shareKey string, shareInfo SMBShare) {
-	conn, err := aw.smbManager.GetConnection(shareKey)
+	// Normalize shareKey to use forward slashes for lookup
+	normalizedShareKey := strings.ReplaceAll(shareKey, "\\", "/")
+
+	conn, err := aw.smbManager.GetConnection(normalizedShareKey)
 	if err != nil {
-		log.Printf("Failed to get SMB connection for %s: %v", shareKey, err)
+		log.Printf("Failed to get SMB connection for %s: %v", normalizedShareKey, err)
 		return
 	}
 
@@ -424,14 +430,17 @@ func (aw *AppWatcher) scanSMBShare(shareKey string, shareInfo SMBShare) {
 		basePath = "."
 	}
 
-	err = aw.walkSMBDirectory(conn.Share, basePath, shareKey)
+	err = aw.walkSMBDirectory(conn.Share, basePath, normalizedShareKey)
 	if err != nil {
 		log.Printf("Failed to walk SMB directory %s: %v", basePath, err)
 	}
 }
 
 func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey string) error {
-	dir, err := share.Open(path)
+	// Ensure path uses forward slashes for SMB
+	normalizedPath := strings.ReplaceAll(path, "\\", "/")
+
+	dir, err := share.Open(normalizedPath)
 	if err != nil {
 		return err
 	}
@@ -442,7 +451,7 @@ func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey 
 		return err
 	}
 
-	log.Printf("SMB Directory %s contents:", path)
+	log.Printf("SMB Directory %s contents:", normalizedPath)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			log.Printf("  DIR:  %s", entry.Name())
@@ -453,7 +462,7 @@ func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey 
 
 	for _, entry := range entries {
 		// Use forward slashes for SMB paths
-		fullPath := strings.Join([]string{path, entry.Name()}, "/")
+		fullPath := strings.Join([]string{normalizedPath, entry.Name()}, "/")
 
 		if entry.IsDir() {
 			err = aw.walkSMBDirectory(share, fullPath, shareKey)
@@ -488,13 +497,19 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 	dirPath := filepath.Dir(readmePath)
 	dirName := filepath.Base(dirPath)
 
+	// Normalize paths to use forward slashes for comparison
+	normalizedDirPath := strings.ReplaceAll(dirPath, "\\", "/")
+
 	// Create a unique ID that includes the relative path from one of the watched paths
 	var uniqueID string
 	for _, watchPath := range aw.watchPaths {
-		if strings.HasPrefix(dirPath, watchPath) {
+		// Normalize watch path for comparison
+		normalizedWatchPath := strings.ReplaceAll(watchPath, "\\", "/")
+		if strings.HasPrefix(normalizedDirPath, normalizedWatchPath) {
 			relPath, err := filepath.Rel(watchPath, dirPath)
 			if err == nil {
-				uniqueID = relPath
+				// Convert relative path to use forward slashes for consistency
+				uniqueID = strings.ReplaceAll(relPath, "\\", "/")
 				break
 			}
 		}
@@ -533,13 +548,21 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 }
 
 func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
-	// readmePath is already in SMB format: share/path/to/package/README.md
+	// Normalize readmePath to use forward slashes
+	normalizedReadmePath := strings.ReplaceAll(readmePath, "\\", "/")
+	normalizedShareKey := strings.ReplaceAll(shareKey, "\\", "/")
+
 	// Extract relative path from share root
-	rest := strings.TrimPrefix(readmePath, shareKey+"/")
+	rest := strings.TrimPrefix(normalizedReadmePath, normalizedShareKey+"/")
+
+	// Remove leading slash if present
+	if strings.HasPrefix(rest, "/") {
+		rest = rest[1:]
+	}
 
 	// Create unique ID with SMB prefix - include full path
-	uniqueID := fmt.Sprintf("smb:%s/%s", shareKey, rest)
-	log.Printf("SMB Package ID: %s from readmePath: %s, shareKey: %s, rest: %s", uniqueID, readmePath, shareKey, rest)
+	uniqueID := fmt.Sprintf("smb:%s/%s", normalizedShareKey, rest)
+	log.Printf("SMB Package ID: %s from readmePath: %s, shareKey: %s, rest: %s", uniqueID, normalizedReadmePath, normalizedShareKey, rest)
 
 	metadata, err := aw.extractSMBMetadata(readmePath, shareKey)
 	if err != nil {
@@ -1110,13 +1133,19 @@ func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
 		relativePath = pathParts[1]
 	}
 
+	// Use forward slashes consistently for shareKey
+	// Use forward slashes consistently for shareKey
 	shareKey := fmt.Sprintf("%s/%s", host, share)
+	shareKey = strings.ReplaceAll(shareKey, "\\", "/")
 
 	log.Printf("SMB Download - AppID: %s, ShareKey: %s, RelativePath: %s, DownloadLink: %s",
 		app.ID, shareKey, relativePath, app.DownloadLink)
 
+	// Normalize shareKey to use forward slashes for lookup (Windows might store with backslashes)
+	normalizedShareKey := strings.ReplaceAll(shareKey, "\\", "/")
+
 	// Get SMB connection
-	conn, err := globalSMBManager.GetConnection(shareKey)
+	conn, err := globalSMBManager.GetConnection(normalizedShareKey)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("SMB connection error: %v", err), http.StatusInternalServerError)
 		return

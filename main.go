@@ -560,9 +560,12 @@ func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
 		rest = rest[1:]
 	}
 
-	// Create unique ID with SMB prefix - include full path
-	uniqueID := fmt.Sprintf("smb:%s/%s", normalizedShareKey, rest)
-	log.Printf("SMB Package ID: %s from readmePath: %s, shareKey: %s, rest: %s", uniqueID, normalizedReadmePath, normalizedShareKey, rest)
+	// Remove README.md suffix from rest to create clean app ID
+	appPath := strings.TrimSuffix(rest, "/README.md")
+
+	// Create unique ID with SMB prefix - include full path without README.md
+	uniqueID := fmt.Sprintf("smb:%s/%s", normalizedShareKey, appPath)
+	log.Printf("SMB Package ID: %s from readmePath: %s, shareKey: %s, rest: %s", uniqueID, normalizedReadmePath, normalizedShareKey, appPath)
 
 	metadata, err := aw.extractSMBMetadata(readmePath, shareKey)
 	if err != nil {
@@ -1122,15 +1125,12 @@ func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
 	host := parts[0]
 	fullPath := parts[1] // This contains share/path/to/package
 
-	// Extract just the directory path (remove filename)
-	dirPath := filepath.Dir(fullPath)
-
-	// Split directory path by first slash to separate share from relative path
-	pathParts := strings.SplitN(dirPath, "/", 2)
+	// Split fullPath by first slash to separate share from rest
+	pathParts := strings.SplitN(fullPath, "/", 2)
 	share := pathParts[0]
 	relativePath := ""
 	if len(pathParts) > 1 {
-		relativePath = pathParts[1]
+		relativePath = pathParts[1] // This should be the full path including package directory
 	}
 
 	// Use forward slashes consistently for shareKey

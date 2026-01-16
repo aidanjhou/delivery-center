@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v2"
 )
 
@@ -137,10 +138,10 @@ var templates *template.Template
 var appsMutex sync.RWMutex
 
 type AppWatcher struct {
-	watcher   *fsnotify.Watcher
-	watchPath string
-	stopChan  chan bool
-	ticker    *time.Ticker
+	watcher    *fsnotify.Watcher
+	watchPaths []string
+	stopChan   chan bool
+	ticker     *time.Ticker
 }
 
 type PackageMetadata struct {
@@ -157,22 +158,24 @@ type PackageMetadata struct {
 	DownloadLink string    `json:"download_link"`
 }
 
-func NewAppWatcher(watchPath string) (*AppWatcher, error) {
+func NewAppWatcher(watchPaths []string) (*AppWatcher, error) {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return nil, err
 	}
 
 	return &AppWatcher{
-		watcher:   watcher,
-		watchPath: watchPath,
-		stopChan:  make(chan bool),
+		watcher:    watcher,
+		watchPaths: watchPaths,
+		stopChan:   make(chan bool),
 	}, nil
 }
 
 func (aw *AppWatcher) Start() error {
-	if err := aw.watcher.Add(aw.watchPath); err != nil {
-		return err
+	for _, path := range aw.watchPaths {
+		if err := aw.watcher.Add(path); err != nil {
+			return err
+		}
 	}
 
 	aw.ticker = time.NewTicker(60 * time.Second)
@@ -215,15 +218,17 @@ func (aw *AppWatcher) watchLoop() {
 }
 
 func (aw *AppWatcher) scanExistingPackages() {
-	filepath.WalkDir(aw.watchPath, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !d.IsDir() && aw.isPackageFile(path) {
-			aw.processPackage(path)
-		}
-		return nil
-	})
+	for _, watchPath := range aw.watchPaths {
+		filepath.WalkDir(watchPath, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if !d.IsDir() && aw.isPackageFile(path) {
+				aw.processPackage(path)
+			}
+			return nil
+		})
+	}
 }
 
 func (aw *AppWatcher) isPackageFile(filename string) bool {
@@ -234,6 +239,21 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 	dirPath := filepath.Dir(readmePath)
 	dirName := filepath.Base(dirPath)
 
+	// Create a unique ID that includes the relative path from one of the watched paths
+	var uniqueID string
+	for _, watchPath := range aw.watchPaths {
+		if strings.HasPrefix(dirPath, watchPath) {
+			relPath, err := filepath.Rel(watchPath, dirPath)
+			if err == nil {
+				uniqueID = relPath
+				break
+			}
+		}
+	}
+	if uniqueID == "" {
+		uniqueID = dirName
+	}
+
 	metadata, err := aw.extractMetadata(readmePath)
 	if err != nil {
 		log.Printf("Failed to extract metadata from %s: %v", readmePath, err)
@@ -241,7 +261,7 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 	}
 
 	app := App{
-		ID:           dirName,
+		ID:           uniqueID,
 		Name:         metadata.Name,
 		Category:     metadata.Category,
 		Description:  metadata.Description,
@@ -517,8 +537,27 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Otherwise, treat as relative file path and proxy the download
-	// Always prepend with packages/appID/
-	filePath := filepath.Join("packages", appID, app.DownloadLink)
+	// Try to find the app in any of the watched directories
+	var filePath string
+	watchPaths := strings.Split(os.Getenv("MANAGED_FOLDERS"), ",")
+	if watchPaths[0] == "" {
+		watchPaths = []string{"packages"}
+	}
+
+	for _, watchPath := range watchPaths {
+		watchPath = strings.TrimSpace(watchPath)
+		testPath := filepath.Join(watchPath, appID, app.DownloadLink)
+		if _, err := os.Stat(testPath); err == nil {
+			filePath = testPath
+			break
+		}
+	}
+
+	if filePath == "" {
+		// Fallback to first watched path
+		filePath = filepath.Join(strings.TrimSpace(watchPaths[0]), appID, app.DownloadLink)
+	}
+
 	http.ServeFile(w, r, filePath)
 }
 
@@ -530,12 +569,32 @@ func renderTemplate(w http.ResponseWriter, templateName string, data interface{}
 }
 
 func main() {
-	watchPath := "./packages"
-	if err := os.MkdirAll(watchPath, 0755); err != nil {
-		log.Fatal("Failed to create watch directory:", err)
+	// Load .env file
+	if err := godotenv.Load(); err != nil {
+		log.Println("No .env file found, using default values")
 	}
 
-	watcher, err := NewAppWatcher(watchPath)
+	// Get managed folders from environment
+	managedFoldersEnv := os.Getenv("MANAGED_FOLDERS")
+	var watchPaths []string
+
+	if managedFoldersEnv == "" {
+		watchPaths = []string{"./packages"}
+	} else {
+		folders := strings.Split(managedFoldersEnv, ",")
+		for _, folder := range folders {
+			watchPaths = append(watchPaths, strings.TrimSpace(folder))
+		}
+	}
+
+	// Create directories if they don't exist
+	for _, watchPath := range watchPaths {
+		if err := os.MkdirAll(watchPath, 0755); err != nil {
+			log.Fatal("Failed to create watch directory:", watchPath, err)
+		}
+	}
+
+	watcher, err := NewAppWatcher(watchPaths)
 	if err != nil {
 		log.Fatal("Failed to create watcher:", err)
 	}
@@ -550,11 +609,16 @@ func main() {
 	http.HandleFunc("/app/", appDetailHandler)
 	http.HandleFunc("/download/", downloadHandler)
 
-	port := ":8080"
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+	port = ":" + port
+
 	fmt.Printf("Server starting on port %s...\n", port)
 	fmt.Printf("Home: http://localhost%s\n", port)
 	fmt.Printf("Apps: http://localhost%s/apps\n", port)
-	fmt.Printf("Watching packages directory: %s\n", watchPath)
+	fmt.Printf("Watching directories: %v\n", watchPaths)
 
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal("Server error:", err)

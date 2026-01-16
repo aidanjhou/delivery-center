@@ -1151,15 +1151,21 @@ func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
 		return
 	}
 
-	// Clean up download link - convert backslashes to forward slashes and extract just the filename
-	cleanDownloadLink := strings.ReplaceAll(app.DownloadLink, "\\", "/")
-	if strings.Contains(cleanDownloadLink, "/") {
-		parts := strings.Split(cleanDownloadLink, "/")
+	// Clean up download link - extract just the filename
+	cleanDownloadLink := app.DownloadLink
+	if strings.Contains(cleanDownloadLink, "/") || strings.Contains(cleanDownloadLink, "\\") {
+		// Split on both forward and backward slashes
+		parts := strings.FieldsFunc(cleanDownloadLink, func(c rune) bool { return c == '/' || c == '\\' })
 		cleanDownloadLink = parts[len(parts)-1] // Get just the filename
 	}
 
-	// Construct full file path - use forward slashes for SMB
-	filePath := strings.Join([]string{relativePath, cleanDownloadLink}, "/")
+	// Construct full file path - use backslashes for SMB (Windows compatibility)
+	var filePath string
+	if relativePath != "" {
+		filePath = strings.Join([]string{relativePath, cleanDownloadLink}, "\\")
+	} else {
+		filePath = cleanDownloadLink
+	}
 
 	log.Printf("SMB Download - Final file path: %s", filePath)
 

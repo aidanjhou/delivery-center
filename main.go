@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -441,8 +442,18 @@ func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey 
 		return err
 	}
 
+	log.Printf("SMB Directory %s contents:", path)
 	for _, entry := range entries {
-		fullPath := filepath.Join(path, entry.Name())
+		if entry.IsDir() {
+			log.Printf("  DIR:  %s", entry.Name())
+		} else {
+			log.Printf("  FILE: %s", entry.Name())
+		}
+	}
+
+	for _, entry := range entries {
+		// Use forward slashes for SMB paths
+		fullPath := strings.Join([]string{path, entry.Name()}, "/")
 
 		if entry.IsDir() {
 			err = aw.walkSMBDirectory(share, fullPath, shareKey)
@@ -450,6 +461,7 @@ func (aw *AppWatcher) walkSMBDirectory(share *smb2.Share, path string, shareKey 
 				log.Printf("Error walking SMB directory %s: %v", fullPath, err)
 			}
 		} else if aw.isPackageFile(entry.Name()) {
+			log.Printf("Found SMB package: %s", fullPath)
 			aw.processSMBPackage(fullPath, shareKey)
 		}
 	}
@@ -521,11 +533,13 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 }
 
 func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
-	dirPath := filepath.Dir(readmePath)
-	dirName := filepath.Base(dirPath)
+	// readmePath is already in SMB format: share/path/to/package/README.md
+	// Extract relative path from share root
+	rest := strings.TrimPrefix(readmePath, shareKey+"/")
 
-	// Create unique ID with SMB prefix
-	uniqueID := fmt.Sprintf("smb:%s/%s", shareKey, dirName)
+	// Create unique ID with SMB prefix - include full path
+	uniqueID := fmt.Sprintf("smb:%s/%s", shareKey, rest)
+	log.Printf("SMB Package ID: %s from readmePath: %s, shareKey: %s, rest: %s", uniqueID, readmePath, shareKey, rest)
 
 	metadata, err := aw.extractSMBMetadata(readmePath, shareKey)
 	if err != nil {
@@ -988,16 +1002,21 @@ func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	appID := r.URL.Path[len("/download/"):]
 
+	log.Printf("Download request for AppID: '%s'", appID)
 	app, err := getAppByIDFromDB(appID)
 	if err != nil {
+		log.Printf("Database error getting app '%s': %v", appID, err)
 		http.Error(w, fmt.Sprintf("Failed to get app: %v", err), http.StatusInternalServerError)
 		return
 	}
 
 	if app == nil {
+		log.Printf("App not found in database: '%s'", appID)
 		http.NotFound(w, r)
 		return
 	}
+
+	log.Printf("Found app: %+v", *app)
 
 	if app.DownloadLink == "" {
 		http.Error(w, "No download link available", http.StatusNotFound)
@@ -1053,23 +1072,48 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
+	// The app.ID comes from database and should already be correctly formatted
+	// URL decode the app ID first (to handle Chinese characters)
+	decodedID, err := url.QueryUnescape(app.ID)
+	if err != nil {
+		log.Printf("Failed to decode app ID: %v", err)
+		decodedID = app.ID
+	} else {
+		log.Printf("SMB Download - Decoded AppID: %s, Original: %s", decodedID, app.ID)
+	}
+
+	// Handle escaped forward slashes in HTML (\/ -> /)
+	normalizedID := strings.ReplaceAll(decodedID, "\\/", "/")
+
 	// Parse SMB app ID to get share info
-	// Format: smb:host/share/path
-	parts := strings.SplitN(strings.TrimPrefix(app.ID, "smb:"), "/", 3)
+	// Format: smb:host/share/path/to/package (where share can contain Chinese characters)
+	rest := strings.TrimPrefix(normalizedID, "smb:")
+
+	// Split by first slash to separate host from rest of path
+	parts := strings.SplitN(rest, "/", 2)
 	if len(parts) < 2 {
 		http.Error(w, "Invalid SMB app ID format", http.StatusInternalServerError)
 		return
 	}
 
 	host := parts[0]
-	share := parts[1]
+	fullPath := parts[1] // This contains share/path/to/package
+
+	// Extract just the directory path (remove filename)
+	dirPath := filepath.Dir(fullPath)
+
+	// Split directory path by first slash to separate share from relative path
+	pathParts := strings.SplitN(dirPath, "/", 2)
+	share := pathParts[0]
+	relativePath := ""
+	if len(pathParts) > 1 {
+		relativePath = pathParts[1]
+	}
+
 	shareKey := fmt.Sprintf("%s/%s", host, share)
 
-	// Extract relative path from app ID
-	var relativePath string
-	if len(parts) > 2 {
-		relativePath = parts[2]
-	}
+	log.Printf("SMB Download - AppID: %s, ShareKey: %s, RelativePath: %s, DownloadLink: %s",
+		app.ID, shareKey, relativePath, app.DownloadLink)
 
 	// Get SMB connection
 	conn, err := globalSMBManager.GetConnection(shareKey)
@@ -1078,8 +1122,17 @@ func serveSMBFile(w http.ResponseWriter, r *http.Request, app App) {
 		return
 	}
 
-	// Construct full file path
-	filePath := filepath.Join(relativePath, app.DownloadLink)
+	// Clean up download link - convert backslashes to forward slashes and extract just the filename
+	cleanDownloadLink := strings.ReplaceAll(app.DownloadLink, "\\", "/")
+	if strings.Contains(cleanDownloadLink, "/") {
+		parts := strings.Split(cleanDownloadLink, "/")
+		cleanDownloadLink = parts[len(parts)-1] // Get just the filename
+	}
+
+	// Construct full file path - use forward slashes for SMB
+	filePath := strings.Join([]string{relativePath, cleanDownloadLink}, "/")
+
+	log.Printf("SMB Download - Final file path: %s", filePath)
 
 	// Open SMB file
 	file, err := conn.Share.Open(filePath)

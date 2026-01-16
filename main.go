@@ -3,10 +3,17 @@ package main
 import (
 	"fmt"
 	"html/template"
+	"io/fs"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v2"
 )
 
 // Config holds all the literal strings used in the application
@@ -89,7 +96,7 @@ var appConfig = Config{
 		Title:         "交付中心 - 分发包列表",
 		Subtitle:      "浏览全部分发包",
 		BackHome:      "← 返回首页",
-		SearchPlace:   "搜索分发包，过滤条件可以是 name, category, provider...",
+		SearchPlace:   "搜索分发包，过滤条件可以是 name, category, producer...",
 		ResultsAll:    "共 %d 个分发包",
 		ResultsSearch: "找到 %d 个结果，过滤条件是：\"%s\"",
 	},
@@ -99,12 +106,12 @@ var appConfig = Config{
 		BackApps: "← 返回分发包列表",
 		Download: "下载",
 		Labels: DetailLabels{
-			Version:   "Version",
-			Developer: "Provider",
-			Rating:    "Rating",
-			Downloads: "Bookings",
-			Price:     "Price",
-			Updated:   "Updated",
+			Version:   "版本",
+			Developer: "负责人",
+			Rating:    "评分",
+			Downloads: "下载次数",
+			Price:     "价格",
+			Updated:   "更新时间",
 		},
 	},
 }
@@ -126,179 +133,226 @@ type App struct {
 
 var apps []App
 var templates *template.Template
+var appsMutex sync.RWMutex
 
-func init() {
-	apps = []App{
-		{
-			ID:          "1",
-			Name:        "Photo Editor Pro",
-			Category:    "Photography",
-			Description: "Professional photo editing app with filters, effects, and advanced tools.",
-			Version:     "3.2.1",
-			Developer:   "Pixel Studios",
-			Rating:      4.5,
-			Downloads:   1500000,
-			Price:       "$4.99",
-			Icon:        "📷",
-			CreatedAt:   time.Now().Add(-30 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-1 * 24 * time.Hour),
-		},
-		{
-			ID:          "2",
-			Name:        "Task Manager",
-			Category:    "Productivity",
-			Description: "Organize your tasks and projects with this powerful task management app.",
-			Version:     "2.1.0",
-			Developer:   "Productive Apps Inc",
-			Rating:      4.8,
-			Downloads:   2300000,
-			Price:       "Free",
-			Icon:        "✅",
-			CreatedAt:   time.Now().Add(-25 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-2 * 24 * time.Hour),
-		},
-		{
-			ID:          "3",
-			Name:        "Music Stream",
-			Category:    "Music",
-			Description: "Stream millions of songs and discover new music with personalized recommendations.",
-			Version:     "5.4.2",
-			Developer:   "AudioTech",
-			Rating:      4.6,
-			Downloads:   5600000,
-			Price:       "$9.99/month",
-			Icon:        "🎵",
-			CreatedAt:   time.Now().Add(-20 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-3 * 24 * time.Hour),
-		},
-		{
-			ID:          "4",
-			Name:        "Fitness Tracker",
-			Category:    "Health",
-			Description: "Track your workouts, nutrition, and health goals with comprehensive analytics.",
-			Version:     "4.1.3",
-			Developer:   "HealthTech Solutions",
-			Rating:      4.7,
-			Downloads:   3200000,
-			Price:       "$2.99",
-			Icon:        "💪",
-			CreatedAt:   time.Now().Add(-18 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-4 * 24 * time.Hour),
-		},
-		{
-			ID:          "5",
-			Name:        "Weather Now",
-			Category:    "Weather",
-			Description: "Accurate weather forecasts with radar, alerts, and detailed meteorological data.",
-			Version:     "6.0.1",
-			Developer:   "WeatherApps Co",
-			Rating:      4.4,
-			Downloads:   8900000,
-			Price:       "Free",
-			Icon:        "🌤️",
-			CreatedAt:   time.Now().Add(-15 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-5 * 24 * time.Hour),
-		},
-		{
-			ID:          "6",
-			Name:        "Social Connect",
-			Category:    "Social",
-			Description: "Connect with friends and share moments in this innovative social platform.",
-			Version:     "3.5.0",
-			Developer:   "SocialMedia Inc",
-			Rating:      4.2,
-			Downloads:   4500000,
-			Price:       "Free",
-			Icon:        "👥",
-			CreatedAt:   time.Now().Add(-12 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-6 * 24 * time.Hour),
-		},
-		{
-			ID:          "7",
-			Name:        "Banking Secure",
-			Category:    "Finance",
-			Description: "Manage your finances with secure banking, transfers, and investment tracking.",
-			Version:     "7.2.1",
-			Developer:   "FinTech Pro",
-			Rating:      4.9,
-			Downloads:   6700000,
-			Price:       "Free",
-			Icon:        "💰",
-			CreatedAt:   time.Now().Add(-10 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-7 * 24 * time.Hour),
-		},
-		{
-			ID:          "8",
-			Name:        "Game Center",
-			Category:    "Games",
-			Description: "Play hundreds of games in one app with new games added every week.",
-			Version:     "2.8.4",
-			Developer:   "GameStudio",
-			Rating:      4.3,
-			Downloads:   12000000,
-			Price:       "Free",
-			Icon:        "🎮",
-			CreatedAt:   time.Now().Add(-8 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-8 * 24 * time.Hour),
-		},
-		{
-			ID:          "9",
-			Name:        "News Reader",
-			Category:    "News",
-			Description: "Stay informed with news from trusted sources around the world.",
-			Version:     "4.0.2",
-			Developer:   "NewsTech",
-			Rating:      4.5,
-			Downloads:   3400000,
-			Price:       "$1.99",
-			Icon:        "📰",
-			CreatedAt:   time.Now().Add(-6 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-9 * 24 * time.Hour),
-		},
-		{
-			ID:          "10",
-			Name:        "Video Player",
-			Category:    "Multimedia",
-			Description: "Play all video formats with advanced features and subtitle support.",
-			Version:     "5.1.0",
-			Developer:   "MediaTech",
-			Rating:      4.6,
-			Downloads:   7800000,
-			Price:       "Free",
-			Icon:        "🎬",
-			CreatedAt:   time.Now().Add(-4 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-10 * 24 * time.Hour),
-		},
-		{
-			ID:          "11",
-			Name:        "Calculator Plus",
-			Category:    "Utilities",
-			Description: "Advanced calculator with scientific functions and unit conversions.",
-			Version:     "1.5.3",
-			Developer:   "Utility Apps",
-			Rating:      4.7,
-			Downloads:   2100000,
-			Price:       "Free",
-			Icon:        "🧮",
-			CreatedAt:   time.Now().Add(-3 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-11 * 24 * time.Hour),
-		},
-		{
-			ID:          "12",
-			Name:        "Travel Planner",
-			Category:    "Travel",
-			Description: "Plan your trips with itinerary management, booking, and travel guides.",
-			Version:     "3.0.1",
-			Developer:   "TravelTech Solutions",
-			Rating:      4.8,
-			Downloads:   1900000,
-			Price:       "$3.99",
-			Icon:        "✈️",
-			CreatedAt:   time.Now().Add(-2 * 24 * time.Hour),
-			UpdatedAt:   time.Now().Add(-12 * 24 * time.Hour),
-		},
+type AppWatcher struct {
+	watcher   *fsnotify.Watcher
+	watchPath string
+	stopChan  chan bool
+	ticker    *time.Ticker
+}
+
+type PackageMetadata struct {
+	Name        string    `json:"name"`
+	Category    string    `json:"category"`
+	Description string    `json:"description"`
+	Version     string    `json:"version"`
+	Developer   string    `json:"developer"`
+	Rating      float64   `json:"rating"`
+	Downloads   int       `json:"downloads"`
+	Price       string    `json:"price"`
+	Icon        string    `json:"icon"`
+	UpdateTime  time.Time `json:"update_time"`
+}
+
+func NewAppWatcher(watchPath string) (*AppWatcher, error) {
+	watcher, err := fsnotify.NewWatcher()
+	if err != nil {
+		return nil, err
 	}
 
+	return &AppWatcher{
+		watcher:   watcher,
+		watchPath: watchPath,
+		stopChan:  make(chan bool),
+	}, nil
+}
+
+func (aw *AppWatcher) Start() error {
+	if err := aw.watcher.Add(aw.watchPath); err != nil {
+		return err
+	}
+
+	aw.ticker = time.NewTicker(60 * time.Second)
+
+	go aw.watchLoop()
+	aw.scanExistingPackages()
+	return nil
+}
+
+func (aw *AppWatcher) Stop() {
+	aw.stopChan <- true
+	if aw.ticker != nil {
+		aw.ticker.Stop()
+	}
+	aw.watcher.Close()
+}
+
+func (aw *AppWatcher) watchLoop() {
+	for {
+		select {
+		case event, ok := <-aw.watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
+				aw.processPackage(event.Name)
+			}
+		case err, ok := <-aw.watcher.Errors:
+			if !ok {
+				return
+			}
+			log.Printf("Watcher error: %v", err)
+		case <-aw.ticker.C:
+			aw.scanExistingPackages()
+			log.Printf("Periodic scan completed")
+		case <-aw.stopChan:
+			return
+		}
+	}
+}
+
+func (aw *AppWatcher) scanExistingPackages() {
+	filepath.WalkDir(aw.watchPath, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !d.IsDir() && aw.isPackageFile(path) {
+			aw.processPackage(path)
+		}
+		return nil
+	})
+}
+
+func (aw *AppWatcher) isPackageFile(filename string) bool {
+	return filepath.Base(filename) == "README.md"
+}
+
+func (aw *AppWatcher) processPackage(readmePath string) {
+	dirPath := filepath.Dir(readmePath)
+	dirName := filepath.Base(dirPath)
+
+	metadata, err := aw.extractMetadata(readmePath)
+	if err != nil {
+		log.Printf("Failed to extract metadata from %s: %v", readmePath, err)
+		return
+	}
+
+	app := App{
+		ID:          dirName,
+		Name:        metadata.Name,
+		Category:    metadata.Category,
+		Description: metadata.Description,
+		Version:     metadata.Version,
+		Developer:   metadata.Developer,
+		Rating:      metadata.Rating,
+		Downloads:   metadata.Downloads,
+		Price:       metadata.Price,
+		Icon:        metadata.Icon,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   metadata.UpdateTime,
+	}
+
+	appsMutex.Lock()
+	defer appsMutex.Unlock()
+
+	for i, existingApp := range apps {
+		if existingApp.ID == app.ID {
+			apps[i] = app
+			log.Printf("Updated app: %s", app.Name)
+			return
+		}
+	}
+
+	apps = append(apps, app)
+	log.Printf("Added new app: %s", app.Name)
+}
+
+func (aw *AppWatcher) extractMetadata(filePath string) (PackageMetadata, error) {
+	return aw.parseReadmeMetadata(filePath)
+}
+
+func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, error) {
+	content, err := os.ReadFile(readmePath)
+	if err != nil {
+		return PackageMetadata{}, err
+	}
+
+	contentStr := string(content)
+	metadata := PackageMetadata{
+		Name:        "Unknown",
+		Category:    "Unknown",
+		Description: "No description available",
+		Version:     "1.0.0",
+		Developer:   "Unknown",
+		Rating:      10.0,
+		Downloads:   0,
+		Price:       "Free",
+		Icon:        "📦",
+		UpdateTime:  time.Now(),
+	}
+
+	if strings.Contains(contentStr, "---") {
+		parts := strings.SplitN(contentStr, "---", 3)
+		if len(parts) >= 3 {
+			frontMatter := parts[1]
+			description := parts[2]
+
+			metadata.Rating = 10.0
+
+			var frontMatterData map[string]interface{}
+			if err := yaml.Unmarshal([]byte(frontMatter), &frontMatterData); err == nil {
+				if title, ok := frontMatterData["title"].(string); ok {
+					metadata.Name = title
+				}
+				if category, ok := frontMatterData["category"]; ok {
+					if categorySlice, ok := category.([]interface{}); ok && len(categorySlice) > 0 {
+						if firstCat, ok := categorySlice[0].(string); ok {
+							metadata.Category = firstCat
+						}
+					}
+				}
+				if update_time, ok := frontMatterData["update_time"].(string); ok {
+					if updateTime, err := time.Parse(time.RFC3339, update_time); err == nil {
+						metadata.UpdateTime = updateTime
+					}
+				}
+				if producer, ok := frontMatterData["producer"]; ok {
+					if producerSlice, ok := producer.([]interface{}); ok {
+						var producers []string
+						for _, p := range producerSlice {
+							if producerStr, ok := p.(string); ok {
+								producers = append(producers, producerStr)
+							}
+						}
+						metadata.Developer = strings.Join(producers, ", ")
+					}
+				}
+			}
+
+			descLines := strings.Split(description, "\n")
+			for _, line := range descLines {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "<!-- description -->") {
+					continue
+				}
+				if line != "" && !strings.HasPrefix(line, "<") {
+					metadata.Description = line
+					break
+				}
+			}
+
+			if metadata.Name == "Unknown" {
+				dirName := filepath.Base(filepath.Dir(readmePath))
+				metadata.Name = dirName
+			}
+		}
+	}
+
+	return metadata, nil
+}
+
+func init() {
 	var err error
 	templates, err = template.ParseGlob("templates/*.html")
 	if err != nil {
@@ -312,9 +366,13 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	latestApps := apps
+	appsMutex.RLock()
+	latestApps := make([]App, len(apps))
+	copy(latestApps, apps)
+	appsMutex.RUnlock()
+
 	if len(latestApps) > 10 {
-		latestApps = apps[:10]
+		latestApps = latestApps[:10]
 	}
 
 	data := struct {
@@ -330,12 +388,18 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 
 func appListHandler(w http.ResponseWriter, r *http.Request) {
 	searchQuery := r.URL.Query().Get("search")
-	filteredApps := apps
+
+	appsMutex.RLock()
+	allApps := make([]App, len(apps))
+	copy(allApps, apps)
+	appsMutex.RUnlock()
+
+	filteredApps := allApps
 
 	if searchQuery != "" {
 		searchQuery = strings.ToLower(searchQuery)
 		filteredApps = []App{}
-		for _, app := range apps {
+		for _, app := range allApps {
 			if strings.Contains(strings.ToLower(app.Name), searchQuery) ||
 				strings.Contains(strings.ToLower(app.Category), searchQuery) ||
 				strings.Contains(strings.ToLower(app.Description), searchQuery) ||
@@ -363,6 +427,7 @@ func appListHandler(w http.ResponseWriter, r *http.Request) {
 func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 	appID := r.URL.Path[len("/app/"):]
 
+	appsMutex.RLock()
 	var app App
 	found := false
 	for _, a := range apps {
@@ -372,13 +437,19 @@ func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	appsMutex.RUnlock()
 
 	if !found {
 		http.NotFound(w, r)
 		return
 	}
 
-	downloadsFormatted := fmt.Sprintf("%.1fM", float64(app.Downloads)/1000000.0)
+	var downloadsFormatted string
+	if app.Downloads > 0 {
+		downloadsFormatted = fmt.Sprintf("%.1fM", float64(app.Downloads)/1000000.0)
+	} else {
+		downloadsFormatted = "暂无"
+	}
 
 	data := struct {
 		Config             Config
@@ -403,6 +474,21 @@ func renderTemplate(w http.ResponseWriter, templateName string, data interface{}
 }
 
 func main() {
+	watchPath := "./packages"
+	if err := os.MkdirAll(watchPath, 0755); err != nil {
+		log.Fatal("Failed to create watch directory:", err)
+	}
+
+	watcher, err := NewAppWatcher(watchPath)
+	if err != nil {
+		log.Fatal("Failed to create watcher:", err)
+	}
+
+	if err := watcher.Start(); err != nil {
+		log.Fatal("Failed to start watcher:", err)
+	}
+	defer watcher.Stop()
+
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/apps", appListHandler)
 	http.HandleFunc("/app/", appDetailHandler)
@@ -411,6 +497,7 @@ func main() {
 	fmt.Printf("Server starting on port %s...\n", port)
 	fmt.Printf("Home: http://localhost%s\n", port)
 	fmt.Printf("Apps: http://localhost%s/apps\n", port)
+	fmt.Printf("Watching packages directory: %s\n", watchPath)
 
 	if err := http.ListenAndServe(port, nil); err != nil {
 		log.Fatal("Server error:", err)

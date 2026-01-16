@@ -1,0 +1,17 @@
+services:
+  delivery-center:
+    image: aidanjhou/delivery-center:latest
+    container_name: delivery-center
+    network_mode: host
+    environment:
+      - PORT=8080
+      - DATABASE_FILE=/app/data/data.db
+      # MANAGED_FOLDERS=/app/packages,\\192.168.1.100\remote_packages
+      - MANAGED_FOLDERS=/app/packages
+    volumes:
+      - ./data:/app/data
+      - ./packages:/app/packages
+    restart: always
+
+volumes:
+  data:

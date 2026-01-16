@@ -1,0 +1,35 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    tags:
+      - 'release/*'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/${GITHUB_REPOSITORY#*/}
+          TAG="${GITHUB_REF/refs\/tags\/release\//release-}"
+          echo "Building $IMAGE_NAME:$TAG"
+          docker build -t $IMAGE_NAME:$TAG .
+          docker tag $IMAGE_NAME:$TAG $IMAGE_NAME:latest
+
+      - name: Push Docker image
+        run: |
+          IMAGE_NAME=${{ secrets.DOCKER_USERNAME }}/${GITHUB_REPOSITORY#*/}
+          TAG="${GITHUB_REF/refs\/tags\/release\//release-}"
+          echo "Pushing $IMAGE_NAME:$TAG"
+          docker push $IMAGE_NAME:$TAG
+          docker push $IMAGE_NAME:latest

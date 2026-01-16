@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"fmt"
 	"html/template"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/hirochachacha/go-smb2"
 	"github.com/joho/godotenv"
+	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
 )
 
@@ -137,10 +139,9 @@ type App struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
-var apps []App
 var templates *template.Template
-var appsMutex sync.RWMutex
 var globalSMBManager *SMBManager
+var db *sql.DB
 
 type SMBShare struct {
 	Host     string
@@ -512,19 +513,11 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 		UpdatedAt:    metadata.UpdateTime,
 	}
 
-	appsMutex.Lock()
-	defer appsMutex.Unlock()
-
-	for i, existingApp := range apps {
-		if existingApp.ID == app.ID {
-			apps[i] = app
-			log.Printf("Updated app: %s", app.Name)
-			return
-		}
+	// Save to database instead of memory
+	err = saveOrUpdateApp(app)
+	if err != nil {
+		log.Printf("Failed to save app to database: %v", err)
 	}
-
-	apps = append(apps, app)
-	log.Printf("Added new app: %s", app.Name)
 }
 
 func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
@@ -556,19 +549,11 @@ func (aw *AppWatcher) processSMBPackage(readmePath string, shareKey string) {
 		UpdatedAt:    metadata.UpdateTime,
 	}
 
-	appsMutex.Lock()
-	defer appsMutex.Unlock()
-
-	for i, existingApp := range apps {
-		if existingApp.ID == app.ID {
-			apps[i] = app
-			log.Printf("Updated SMB app: %s", app.Name)
-			return
-		}
+	// Save to database instead of memory
+	err = saveOrUpdateApp(app)
+	if err != nil {
+		log.Printf("Failed to save SMB app to database: %v", err)
 	}
-
-	apps = append(apps, app)
-	log.Printf("Added new SMB app: %s", app.Name)
 }
 
 func (aw *AppWatcher) extractMetadata(filePath string) (PackageMetadata, error) {
@@ -697,8 +682,58 @@ func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, e
 	return aw.parseReadmeContent(string(content), dirName)
 }
 
+func initDatabase() error {
+	var err error
+
+	// Get database file path from environment, default to data.db
+	dbFile := os.Getenv("DATABASE_FILE")
+	if dbFile == "" {
+		dbFile = "data.db"
+	}
+
+	db, err = sql.Open("sqlite3", dbFile)
+	if err != nil {
+		return fmt.Errorf("failed to open database: %v", err)
+	}
+
+	// Test the connection
+	if err = db.Ping(); err != nil {
+		return fmt.Errorf("failed to connect to database: %v", err)
+	}
+
+	// Create apps table
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS apps (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		category TEXT NOT NULL,
+		description TEXT NOT NULL,
+		version TEXT NOT NULL,
+		developer TEXT NOT NULL,
+		rating REAL NOT NULL,
+		downloads INTEGER NOT NULL,
+		price TEXT NOT NULL,
+		icon TEXT NOT NULL,
+		download_link TEXT NOT NULL,
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	);`
+
+	if _, err = db.Exec(createTableSQL); err != nil {
+		return fmt.Errorf("failed to create apps table: %v", err)
+	}
+
+	log.Println("Database initialized successfully")
+	return nil
+}
+
 func init() {
 	var err error
+
+	// Initialize database first
+	if err := initDatabase(); err != nil {
+		log.Fatal("Database initialization failed:", err)
+	}
 
 	funcMap := template.FuncMap{
 		"hasPrefix": strings.HasPrefix,
@@ -710,19 +745,165 @@ func init() {
 	}
 }
 
+func saveOrUpdateApp(app App) error {
+	// Check if app already exists
+	var count int
+	err := db.QueryRow("SELECT COUNT(*) FROM apps WHERE id = ?", app.ID).Scan(&count)
+	if err != nil {
+		return fmt.Errorf("failed to check if app exists: %v", err)
+	}
+
+	if count > 0 {
+		// Update existing app
+		updateSQL := `
+		UPDATE apps SET 
+			name = ?, category = ?, description = ?, version = ?, 
+			developer = ?, rating = ?, downloads = ?, price = ?, 
+			icon = ?, download_link = ?, updated_at = ?
+		WHERE id = ?`
+
+		_, err = db.Exec(updateSQL,
+			app.Name, app.Category, app.Description, app.Version,
+			app.Developer, app.Rating, app.Downloads, app.Price,
+			app.Icon, app.DownloadLink, app.UpdatedAt, app.ID)
+
+		if err != nil {
+			return fmt.Errorf("failed to update app: %v", err)
+		}
+		log.Printf("Updated app in database: %s", app.Name)
+	} else {
+		// Insert new app
+		insertSQL := `
+		INSERT INTO apps (
+			id, name, category, description, version, developer,
+			rating, downloads, price, icon, download_link,
+			created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+
+		_, err = db.Exec(insertSQL,
+			app.ID, app.Name, app.Category, app.Description, app.Version,
+			app.Developer, app.Rating, app.Downloads, app.Price,
+			app.Icon, app.DownloadLink, app.CreatedAt, app.UpdatedAt)
+
+		if err != nil {
+			return fmt.Errorf("failed to insert app: %v", err)
+		}
+		log.Printf("Added new app to database: %s", app.Name)
+	}
+
+	return nil
+}
+
+func getAppsFromDB(limit int) ([]App, error) {
+	query := "SELECT id, name, category, description, version, developer, rating, downloads, price, icon, download_link, created_at, updated_at FROM apps ORDER BY updated_at DESC"
+
+	if limit > 0 {
+		query += " LIMIT ?"
+	}
+
+	rows, err := db.Query(query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query apps: %v", err)
+	}
+	defer rows.Close()
+
+	var apps []App
+	for rows.Next() {
+		var app App
+		err := rows.Scan(
+			&app.ID, &app.Name, &app.Category, &app.Description,
+			&app.Version, &app.Developer, &app.Rating, &app.Downloads,
+			&app.Price, &app.Icon, &app.DownloadLink,
+			&app.CreatedAt, &app.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan app row: %v", err)
+		}
+		apps = append(apps, app)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating app rows: %v", err)
+	}
+
+	return apps, nil
+}
+
+func searchAppsInDB(searchQuery string) ([]App, error) {
+	query := `
+		SELECT id, name, category, description, version, developer, 
+			   rating, downloads, price, icon, download_link, 
+			   created_at, updated_at 
+		FROM apps 
+		WHERE LOWER(name) LIKE ? OR LOWER(category) LIKE ? OR 
+			  LOWER(description) LIKE ? OR LOWER(developer) LIKE ?
+		ORDER BY updated_at DESC`
+
+	searchPattern := "%" + strings.ToLower(searchQuery) + "%"
+
+	rows, err := db.Query(query, searchPattern, searchPattern, searchPattern, searchPattern)
+	if err != nil {
+		return nil, fmt.Errorf("failed to search apps: %v", err)
+	}
+	defer rows.Close()
+
+	var apps []App
+	for rows.Next() {
+		var app App
+		err := rows.Scan(
+			&app.ID, &app.Name, &app.Category, &app.Description,
+			&app.Version, &app.Developer, &app.Rating, &app.Downloads,
+			&app.Price, &app.Icon, &app.DownloadLink,
+			&app.CreatedAt, &app.UpdatedAt,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan app row: %v", err)
+		}
+		apps = append(apps, app)
+	}
+
+	if err = rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating app rows: %v", err)
+	}
+
+	return apps, nil
+}
+
+func getAppByIDFromDB(appID string) (*App, error) {
+	query := `
+		SELECT id, name, category, description, version, developer, 
+			   rating, downloads, price, icon, download_link, 
+			   created_at, updated_at 
+		FROM apps WHERE id = ?`
+
+	var app App
+	err := db.QueryRow(query, appID).Scan(
+		&app.ID, &app.Name, &app.Category, &app.Description,
+		&app.Version, &app.Developer, &app.Rating, &app.Downloads,
+		&app.Price, &app.Icon, &app.DownloadLink,
+		&app.CreatedAt, &app.UpdatedAt,
+	)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil // App not found
+		}
+		return nil, fmt.Errorf("failed to get app by ID: %v", err)
+	}
+
+	return &app, nil
+}
+
 func homeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path != "/" {
 		http.NotFound(w, r)
 		return
 	}
 
-	appsMutex.RLock()
-	latestApps := make([]App, len(apps))
-	copy(latestApps, apps)
-	appsMutex.RUnlock()
-
-	if len(latestApps) > 10 {
-		latestApps = latestApps[:10]
+	latestApps, err := getAppsFromDB(10)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get apps: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	data := struct {
@@ -739,24 +920,18 @@ func homeHandler(w http.ResponseWriter, r *http.Request) {
 func appListHandler(w http.ResponseWriter, r *http.Request) {
 	searchQuery := r.URL.Query().Get("search")
 
-	appsMutex.RLock()
-	allApps := make([]App, len(apps))
-	copy(allApps, apps)
-	appsMutex.RUnlock()
-
-	filteredApps := allApps
+	var apps []App
+	var err error
 
 	if searchQuery != "" {
-		searchQuery = strings.ToLower(searchQuery)
-		filteredApps = []App{}
-		for _, app := range allApps {
-			if strings.Contains(strings.ToLower(app.Name), searchQuery) ||
-				strings.Contains(strings.ToLower(app.Category), searchQuery) ||
-				strings.Contains(strings.ToLower(app.Description), searchQuery) ||
-				strings.Contains(strings.ToLower(app.Developer), searchQuery) {
-				filteredApps = append(filteredApps, app)
-			}
-		}
+		apps, err = searchAppsInDB(searchQuery)
+	} else {
+		apps, err = getAppsFromDB(0) // 0 means no limit
+	}
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get apps: %v", err), http.StatusInternalServerError)
+		return
 	}
 
 	data := struct {
@@ -766,9 +941,9 @@ func appListHandler(w http.ResponseWriter, r *http.Request) {
 		TotalCount  int
 	}{
 		Config:      appConfig,
-		Apps:        filteredApps,
+		Apps:        apps,
 		SearchQuery: searchQuery,
-		TotalCount:  len(filteredApps),
+		TotalCount:  len(apps),
 	}
 
 	renderTemplate(w, "apps.html", data)
@@ -777,19 +952,13 @@ func appListHandler(w http.ResponseWriter, r *http.Request) {
 func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 	appID := r.URL.Path[len("/app/"):]
 
-	appsMutex.RLock()
-	var app App
-	found := false
-	for _, a := range apps {
-		if a.ID == appID {
-			app = a
-			found = true
-			break
-		}
+	app, err := getAppByIDFromDB(appID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get app: %v", err), http.StatusInternalServerError)
+		return
 	}
-	appsMutex.RUnlock()
 
-	if !found {
+	if app == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -809,7 +978,7 @@ func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 	}{
 		Config:             appConfig,
 		Title:              fmt.Sprintf(appConfig.Detail.Title, app.Name),
-		App:                app,
+		App:                *app,
 		DownloadsFormatted: downloadsFormatted,
 	}
 
@@ -819,19 +988,13 @@ func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	appID := r.URL.Path[len("/download/"):]
 
-	appsMutex.RLock()
-	var app App
-	found := false
-	for _, a := range apps {
-		if a.ID == appID {
-			app = a
-			found = true
-			break
-		}
+	app, err := getAppByIDFromDB(appID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get app: %v", err), http.StatusInternalServerError)
+		return
 	}
-	appsMutex.RUnlock()
 
-	if !found {
+	if app == nil {
 		http.NotFound(w, r)
 		return
 	}
@@ -850,7 +1013,7 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is an SMB app
 	if strings.HasPrefix(app.ID, "smb:") {
-		serveSMBFile(w, r, app)
+		serveSMBFile(w, r, *app)
 		return
 	}
 
@@ -990,6 +1153,7 @@ func main() {
 	}
 	defer watcher.Stop()
 	defer globalSMBManager.CloseAll()
+	defer db.Close()
 
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/apps", appListHandler)

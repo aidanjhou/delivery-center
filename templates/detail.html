@@ -70,7 +70,15 @@
                 </div>
             </div>
             
-            <a href="#" class="download-btn">{{.Config.Detail.Download}}</a>
+            {{if .App.DownloadLink}}
+                {{if or (hasPrefix .App.DownloadLink "http://") (hasPrefix .App.DownloadLink "https://")}}
+                    <a href="{{.App.DownloadLink}}" class="download-btn" target="_blank">{{.Config.Detail.Download}}</a>
+                {{else}}
+                    <a href="/download/{{.App.ID}}" class="download-btn">{{.Config.Detail.Download}}</a>
+                {{end}}
+            {{else}}
+                <span class="download-btn" style="background: #ccc; cursor: not-allowed;">{{.Config.Detail.Download}} (不可用)</span>
+            {{end}}
         </div>
     </div>
 </body>

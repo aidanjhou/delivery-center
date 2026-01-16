@@ -117,18 +117,19 @@ var appConfig = Config{
 }
 
 type App struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Category    string    `json:"category"`
-	Description string    `json:"description"`
-	Version     string    `json:"version"`
-	Developer   string    `json:"developer"`
-	Rating      float64   `json:"rating"`
-	Downloads   int       `json:"downloads"`
-	Price       string    `json:"price"`
-	Icon        string    `json:"icon"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Category     string    `json:"category"`
+	Description  string    `json:"description"`
+	Version      string    `json:"version"`
+	Developer    string    `json:"developer"`
+	Rating       float64   `json:"rating"`
+	Downloads    int       `json:"downloads"`
+	Price        string    `json:"price"`
+	Icon         string    `json:"icon"`
+	DownloadLink string    `json:"download_link"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 var apps []App
@@ -143,16 +144,17 @@ type AppWatcher struct {
 }
 
 type PackageMetadata struct {
-	Name        string    `json:"name"`
-	Category    string    `json:"category"`
-	Description string    `json:"description"`
-	Version     string    `json:"version"`
-	Developer   string    `json:"developer"`
-	Rating      float64   `json:"rating"`
-	Downloads   int       `json:"downloads"`
-	Price       string    `json:"price"`
-	Icon        string    `json:"icon"`
-	UpdateTime  time.Time `json:"update_time"`
+	Name         string    `json:"name"`
+	Category     string    `json:"category"`
+	Description  string    `json:"description"`
+	Version      string    `json:"version"`
+	Developer    string    `json:"developer"`
+	Rating       float64   `json:"rating"`
+	Downloads    int       `json:"downloads"`
+	Price        string    `json:"price"`
+	Icon         string    `json:"icon"`
+	UpdateTime   time.Time `json:"update_time"`
+	DownloadLink string    `json:"download_link"`
 }
 
 func NewAppWatcher(watchPath string) (*AppWatcher, error) {
@@ -239,18 +241,19 @@ func (aw *AppWatcher) processPackage(readmePath string) {
 	}
 
 	app := App{
-		ID:          dirName,
-		Name:        metadata.Name,
-		Category:    metadata.Category,
-		Description: metadata.Description,
-		Version:     metadata.Version,
-		Developer:   metadata.Developer,
-		Rating:      metadata.Rating,
-		Downloads:   metadata.Downloads,
-		Price:       metadata.Price,
-		Icon:        metadata.Icon,
-		CreatedAt:   time.Now(),
-		UpdatedAt:   metadata.UpdateTime,
+		ID:           dirName,
+		Name:         metadata.Name,
+		Category:     metadata.Category,
+		Description:  metadata.Description,
+		Version:      metadata.Version,
+		Developer:    metadata.Developer,
+		Rating:       metadata.Rating,
+		Downloads:    metadata.Downloads,
+		Price:        metadata.Price,
+		Icon:         metadata.Icon,
+		DownloadLink: metadata.DownloadLink,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    metadata.UpdateTime,
 	}
 
 	appsMutex.Lock()
@@ -280,16 +283,17 @@ func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, e
 
 	contentStr := string(content)
 	metadata := PackageMetadata{
-		Name:        "Unknown",
-		Category:    "Unknown",
-		Description: "No description available",
-		Version:     "1.0.0",
-		Developer:   "Unknown",
-		Rating:      10.0,
-		Downloads:   0,
-		Price:       "Free",
-		Icon:        "📦",
-		UpdateTime:  time.Now(),
+		Name:         "Unknown",
+		Category:     "Unknown",
+		Description:  "No description available",
+		Version:      "1.0.0",
+		Developer:    "Unknown",
+		Rating:       10.0,
+		Downloads:    0,
+		Price:        "Free",
+		Icon:         "📦",
+		UpdateTime:   time.Now(),
+		DownloadLink: "",
 	}
 
 	if strings.Contains(contentStr, "---") {
@@ -328,6 +332,15 @@ func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, e
 						metadata.Developer = strings.Join(producers, ", ")
 					}
 				}
+				if downloadLink, ok := frontMatterData["download_link"]; ok {
+					if downloadLinkSlice, ok := downloadLink.([]interface{}); ok && len(downloadLinkSlice) > 0 {
+						if firstLink, ok := downloadLinkSlice[0].(string); ok {
+							metadata.DownloadLink = firstLink
+						}
+					} else if downloadLinkStr, ok := downloadLink.(string); ok {
+						metadata.DownloadLink = downloadLinkStr
+					}
+				}
 			}
 
 			descLines := strings.Split(description, "\n")
@@ -354,7 +367,12 @@ func (aw *AppWatcher) parseReadmeMetadata(readmePath string) (PackageMetadata, e
 
 func init() {
 	var err error
-	templates, err = template.ParseGlob("templates/*.html")
+
+	funcMap := template.FuncMap{
+		"hasPrefix": strings.HasPrefix,
+	}
+
+	templates, err = template.New("").Funcs(funcMap).ParseGlob("templates/*.html")
 	if err != nil {
 		log.Fatal("Error parsing templates:", err)
 	}
@@ -466,6 +484,44 @@ func appDetailHandler(w http.ResponseWriter, r *http.Request) {
 	renderTemplate(w, "detail.html", data)
 }
 
+func downloadHandler(w http.ResponseWriter, r *http.Request) {
+	appID := r.URL.Path[len("/download/"):]
+
+	appsMutex.RLock()
+	var app App
+	found := false
+	for _, a := range apps {
+		if a.ID == appID {
+			app = a
+			found = true
+			break
+		}
+	}
+	appsMutex.RUnlock()
+
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	if app.DownloadLink == "" {
+		http.Error(w, "No download link available", http.StatusNotFound)
+		return
+	}
+
+	// If it's an external URL (http/https), redirect directly
+	if strings.HasPrefix(app.DownloadLink, "http://") ||
+		strings.HasPrefix(app.DownloadLink, "https://") {
+		http.Redirect(w, r, app.DownloadLink, http.StatusMovedPermanently)
+		return
+	}
+
+	// Otherwise, treat as relative file path and proxy the download
+	// Always prepend with packages/appID/
+	filePath := filepath.Join("packages", appID, app.DownloadLink)
+	http.ServeFile(w, r, filePath)
+}
+
 func renderTemplate(w http.ResponseWriter, templateName string, data interface{}) {
 	err := templates.ExecuteTemplate(w, templateName, data)
 	if err != nil {
@@ -492,6 +548,7 @@ func main() {
 	http.HandleFunc("/", homeHandler)
 	http.HandleFunc("/apps", appListHandler)
 	http.HandleFunc("/app/", appDetailHandler)
+	http.HandleFunc("/download/", downloadHandler)
 
 	port := ":8080"
 	fmt.Printf("Server starting on port %s...\n", port)
